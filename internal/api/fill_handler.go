@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/wyw14/cry-98/internal/circuit"
 	"github.com/wyw14/cry-98/internal/fill"
+	"github.com/wyw14/cry-98/internal/vessel"
 )
 
 type startFillRequest struct {
@@ -31,14 +32,29 @@ func (s *Server) startFill(writer http.ResponseWriter, request *http.Request) {
 	}
 	session, err := s.deps.Fills.StartManual(request.Context(), input.VesselID, input.Liters)
 	if err != nil {
-		status := http.StatusConflict
-		if !errors.Is(err, fill.ErrActiveSession) && !errors.Is(err, circuit.ErrCircuitBusy) {
-			status = http.StatusBadRequest
-		}
-		writeError(writer, status, err.Error())
+		writeError(writer, startFillStatus(err), err.Error())
 		return
 	}
 	writeJSON(writer, http.StatusCreated, session)
+}
+
+// startFillStatus maps fill rejections to a status that distinguishes bad
+// requests, capacity/level conflicts, and busy resources. The error message
+// itself carries the explicit refusal reason.
+func startFillStatus(err error) int {
+	switch {
+	case errors.Is(err, vessel.ErrInvalidFillVolume):
+		return http.StatusBadRequest
+	case errors.Is(err, vessel.ErrGeometryNotConfigured), errors.Is(err, vessel.ErrExceedsSingleFill):
+		return http.StatusUnprocessableEntity
+	case errors.Is(err, fill.ErrActiveSession),
+		errors.Is(err, circuit.ErrCircuitBusy),
+		errors.Is(err, vessel.ErrLevelUnknown),
+		errors.Is(err, vessel.ErrInsufficientCapacity):
+		return http.StatusConflict
+	default:
+		return http.StatusBadRequest
+	}
 }
 
 func (s *Server) beginSoak(writer http.ResponseWriter, request *http.Request) {

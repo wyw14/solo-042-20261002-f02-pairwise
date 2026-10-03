@@ -38,6 +38,8 @@ func (s *AbortService) Abort(ctx context.Context, sessionID uuid.UUID, reason st
 		_ = s.coordinator.circuits.RetainFault(session.CircuitID, session.ID)
 		failed := session.Failed(reason+": "+err.Error(), s.now())
 		s.coordinator.sessions[session.ID] = failed
+		// Circuit stays faulted and the session blocks the vessel until
+		// RecoverIsolation, which releases the capacity reservation.
 		return failed, err
 	}
 	if err := s.coordinator.circuits.Release(session.CircuitID, session.ID); err != nil {
@@ -48,6 +50,9 @@ func (s *AbortService) Abort(ctx context.Context, sessionID uuid.UUID, reason st
 		return model.FillSession{}, err
 	}
 	s.coordinator.finishState(failed)
+	if s.coordinator.capacity != nil {
+		s.coordinator.capacity.ReleaseFill(session.VesselID, session.ID)
+	}
 	return failed, nil
 }
 
@@ -62,6 +67,9 @@ func (s *AbortService) RecoverIsolation(sessionID uuid.UUID) error {
 		return err
 	}
 	delete(s.coordinator.active, session.VesselID)
+	if s.coordinator.capacity != nil {
+		s.coordinator.capacity.ReleaseFill(session.VesselID, session.ID)
+	}
 	_, err := s.coordinator.vessels.FinishFill(session.VesselID)
 	return err
 }

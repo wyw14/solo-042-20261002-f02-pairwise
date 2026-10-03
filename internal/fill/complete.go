@@ -74,5 +74,10 @@ func (s *CompletionService) Complete(ctx context.Context, sessionID uuid.UUID) (
 		return model.FillSession{}, err
 	}
 	s.coordinator.finishState(completed)
+	if s.coordinator.capacity != nil {
+		if err := s.coordinator.capacity.CommitFill(session.VesselID, session.ID, s.now()); err != nil {
+			return completed, err
+		}
+	}
 	return completed, nil
 }

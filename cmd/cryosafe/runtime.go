@@ -45,6 +45,18 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 	}
 	slog.Info("journal opened", "root", store.Root(), "partitions", len(partitions))
 	vesselRegistry := vessel.NewRegistry()
+	// Per-vessel fill geometry: probe height (mm) and cross section (mm²)
+	// give the mm→litre mapping; max_fill_ratio caps the safe fill height,
+	// reserve_mm keeps a headspace band below it, and max_single_liters caps
+	// one session.
+	geometries := map[string]model.VesselGeometry{
+		"V-03": {HeightMM: 2000, CrossSectionMM2: 100000, MaxFillRatio: 0.9, MaxSingleLiters: 50, ReserveMM: 100},
+		"V-07": {HeightMM: 1600, CrossSectionMM2: 100000, MaxFillRatio: 0.9, MaxSingleLiters: 40, ReserveMM: 100},
+		"V-09": {HeightMM: 2400, CrossSectionMM2: 125000, MaxFillRatio: 0.85, MaxSingleLiters: 60, ReserveMM: 120},
+		"V-12": {HeightMM: 1800, CrossSectionMM2: 100000, MaxFillRatio: 0.9, MaxSingleLiters: 45, ReserveMM: 100},
+		"V-15": {HeightMM: 2000, CrossSectionMM2: 125000, MaxFillRatio: 0.85, MaxSingleLiters: 55, ReserveMM: 120},
+		"V-18": {HeightMM: 1600, CrossSectionMM2: 125000, MaxFillRatio: 0.9, MaxSingleLiters: 40, ReserveMM: 80},
+	}
 	for _, seed := range []struct{ id, name, zone string }{
 		{"V-03", "Cryogenic vessel 03", "north"},
 		{"V-07", "Cryogenic vessel 07", "north"},
@@ -53,7 +65,8 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 		{"V-15", "Cryogenic vessel 15", "east"},
 		{"V-18", "Cryogenic vessel 18", "east"},
 	} {
-		item, createErr := model.NewVessel(seed.id, seed.name, seed.zone, now())
+		geometry := geometries[seed.id]
+		item, createErr := model.NewVesselWithGeometry(seed.id, seed.name, seed.zone, &geometry, now())
 		if createErr != nil {
 			return nil, createErr
 		}
@@ -149,7 +162,8 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 	}
 	commandService := valve.NewCommandService(valveController, now)
 	routeService := valve.NewRouteService(commandService)
-	fillCoordinator := fill.NewCoordinator(circuitManager, circuitRegistry, routeService, vesselState, now)
+	capacityService := vessel.NewCapacityService(vesselState)
+	fillCoordinator := fill.NewCoordinator(circuitManager, circuitRegistry, routeService, vesselState, capacityService, now)
 	retryService, err := fill.NewRetryService(commandService, fill.RetryPolicy{Attempts: 3, Delay: 100 * time.Millisecond})
 	if err != nil {
 		return nil, err

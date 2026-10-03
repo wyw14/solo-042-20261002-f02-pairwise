@@ -3,10 +3,12 @@ package fill
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/wyw14/cry-98/internal/model"
+	"github.com/wyw14/cry-98/internal/vessel"
 )
 
 type Service struct {
@@ -25,12 +27,17 @@ func NewService(coordinator *Coordinator, completion *CompletionService, abort *
 
 func (s *Service) OnLowLevel(ctx context.Context, vesselID string, observedAt time.Time) (model.FillSession, error) {
 	_ = observedAt
+	// The automatic default is still validated against level and capacity by
+	// the coordinator before the valve opens.
 	return s.coordinator.StartAutomatic(ctx, vesselID, s.defaultLiters)
 }
 
+// StartManual rejects non-positive or non-finite volumes explicitly instead
+// of silently substituting the automatic default; the operator must see why
+// a request was refused.
 func (s *Service) StartManual(ctx context.Context, vesselID string, liters float64) (model.FillSession, error) {
-	if liters <= 0 {
-		liters = s.defaultLiters
+	if math.IsNaN(liters) || math.IsInf(liters, 0) || liters <= 0 {
+		return model.FillSession{}, vessel.ErrInvalidFillVolume
 	}
 	return s.coordinator.StartManual(ctx, vesselID, liters)
 }

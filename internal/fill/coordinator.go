@@ -25,6 +25,7 @@ type Coordinator struct {
 	routes      *valve.RouteService
 	retry       *RetryService
 	vessels     *vessel.StateService
+	capacity    *vessel.CapacityService
 	now         func() time.Time
 }
 
@@ -34,7 +35,7 @@ func (c *Coordinator) SetRetryService(retry *RetryService) {
 	c.mu.Unlock()
 }
 
-func NewCoordinator(circuits *circuit.Manager, circuitList *circuit.Registry, routes *valve.RouteService, vessels *vessel.StateService, now func() time.Time) *Coordinator {
+func NewCoordinator(circuits *circuit.Manager, circuitList *circuit.Registry, routes *valve.RouteService, vessels *vessel.StateService, capacity *vessel.CapacityService, now func() time.Time) *Coordinator {
 	if now == nil {
 		now = time.Now
 	}
@@ -45,6 +46,7 @@ func NewCoordinator(circuits *circuit.Manager, circuitList *circuit.Registry, ro
 		circuitList: circuitList,
 		routes:      routes,
 		vessels:     vessels,
+		capacity:    capacity,
 		now:         now,
 	}
 }
@@ -55,26 +57,45 @@ func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.F
 	if _, exists := c.active[vesselID]; exists {
 		return model.FillSession{}, ErrActiveSession
 	}
-	selected, err := c.selectCircuit()
-	if err != nil {
-		return model.FillSession{}, err
-	}
 	session, err := model.NewFillSession(vesselID, origin, 1, liters, c.now())
 	if err != nil {
 		return model.FillSession{}, err
 	}
+	// Validate the plan against the current level and reserve its headspace
+	// before touching any circuit or valve. Held until the session finishes;
+	// the capacity service mutex makes this atomic against concurrent plans.
+	if c.capacity != nil {
+		if err := c.capacity.PlanFill(vesselID, session.ID, liters); err != nil {
+			return model.FillSession{}, err
+		}
+	}
+	capacityHeld := true
+	releaseCapacity := func() {
+		if capacityHeld && c.capacity != nil {
+			c.capacity.ReleaseFill(vesselID, session.ID)
+		}
+		capacityHeld = false
+	}
+	selected, err := c.selectCircuit()
+	if err != nil {
+		releaseCapacity()
+		return model.FillSession{}, err
+	}
 	reservation, err := c.circuits.Reserve(selected.ID, vesselID, session.ID, c.now())
 	if err != nil {
+		releaseCapacity()
 		return model.FillSession{}, err
 	}
 	session = session.WithCircuit(selected.ID, c.now())
 	session, err = session.Transition(model.FillPrechecking, c.now())
 	if err != nil {
 		_ = c.circuits.Release(selected.ID, session.ID)
+		releaseCapacity()
 		return model.FillSession{}, err
 	}
 	if _, err := c.vessels.BeginFill(vesselID); err != nil {
 		_ = c.circuits.Release(selected.ID, session.ID)
+		releaseCapacity()
 		return model.FillSession{}, err
 	}
 	route := valve.Route{
@@ -97,10 +118,12 @@ func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.F
 	if openErr != nil {
 		_, _ = c.vessels.FinishFill(vesselID)
 		_ = c.circuits.Release(selected.ID, session.ID)
+		releaseCapacity()
 		return model.FillSession{}, openErr
 	}
 	session, err = session.Transition(model.FillFilling, c.now())
 	if err != nil {
+		releaseCapacity()
 		return model.FillSession{}, err
 	}
 	c.sessions[session.ID] = session
