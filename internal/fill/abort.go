@@ -62,6 +62,7 @@ func (s *AbortService) RecoverIsolation(sessionID uuid.UUID) error {
 		return err
 	}
 	delete(s.coordinator.active, session.VesselID)
+	s.coordinator.releaseHold(session)
 	_, err := s.coordinator.vessels.FinishFill(session.VesselID)
 	return err
 }

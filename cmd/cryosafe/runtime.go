@@ -69,6 +69,27 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 	}
 	vesselState := vessel.NewStateService(vesselRegistry, now)
 
+	capacityRegistry := vessel.NewCapacityRegistry()
+	for _, seed := range []struct {
+		id                                     string
+		litersPerMM, safe, maxSingle, reserved float64
+	}{
+		{"V-03", 0.5, 600, 120, 40},
+		{"V-07", 0.5, 600, 120, 40},
+		{"V-09", 0.5, 600, 120, 40},
+		{"V-12", 0.5, 600, 120, 40},
+		{"V-15", 0.5, 600, 120, 40},
+		{"V-18", 0.5, 600, 120, 40},
+	} {
+		profile, createErr := model.NewVesselCapacity(seed.id, seed.litersPerMM, seed.safe, seed.maxSingle, seed.reserved)
+		if createErr != nil {
+			return nil, createErr
+		}
+		if registerErr := capacityRegistry.Register(profile); registerErr != nil {
+			return nil, registerErr
+		}
+	}
+
 	probeRegistry := probe.NewRegistry(256)
 	for _, seed := range []struct {
 		id, vesselID string
@@ -149,7 +170,7 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 	}
 	commandService := valve.NewCommandService(valveController, now)
 	routeService := valve.NewRouteService(commandService)
-	fillCoordinator := fill.NewCoordinator(circuitManager, circuitRegistry, routeService, vesselState, now)
+	fillCoordinator := fill.NewCoordinator(circuitManager, circuitRegistry, routeService, vesselState, capacityRegistry, now)
 	retryService, err := fill.NewRetryService(commandService, fill.RetryPolicy{Attempts: 3, Delay: 100 * time.Millisecond})
 	if err != nil {
 		return nil, err
@@ -163,7 +184,12 @@ func buildRuntime(cfg config, now func() time.Time) (*runtime, error) {
 	}
 	if err := ingestor.AddObserver(func(sample model.Sample) {
 		if sample.Kind == model.ProbeLevel && sample.Value < 20 {
-			_, _ = fillService.OnLowLevel(context.Background(), sample.VesselID, sample.ObservedAt)
+			if _, err := fillService.OnLowLevel(context.Background(), sample.VesselID, sample.ObservedAt); err != nil {
+				var rejection *fill.PlanRejection
+				if errors.As(err, &rejection) {
+					slog.Warn("automatic fill plan rejected", "vessel", sample.VesselID, "reason", string(rejection.Reason), "detail", rejection.Detail)
+				}
+			}
 		}
 	}); err != nil {
 		return nil, err

@@ -3,6 +3,7 @@ package fill
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -20,11 +21,13 @@ type Coordinator struct {
 	mu          sync.RWMutex
 	sessions    map[uuid.UUID]model.FillSession
 	active      map[string]uuid.UUID
+	held        map[string]float64
 	circuits    *circuit.Manager
 	circuitList *circuit.Registry
 	routes      *valve.RouteService
 	retry       *RetryService
 	vessels     *vessel.StateService
+	capacities  *vessel.CapacityRegistry
 	now         func() time.Time
 }
 
@@ -34,17 +37,19 @@ func (c *Coordinator) SetRetryService(retry *RetryService) {
 	c.mu.Unlock()
 }
 
-func NewCoordinator(circuits *circuit.Manager, circuitList *circuit.Registry, routes *valve.RouteService, vessels *vessel.StateService, now func() time.Time) *Coordinator {
+func NewCoordinator(circuits *circuit.Manager, circuitList *circuit.Registry, routes *valve.RouteService, vessels *vessel.StateService, capacities *vessel.CapacityRegistry, now func() time.Time) *Coordinator {
 	if now == nil {
 		now = time.Now
 	}
 	return &Coordinator{
 		sessions:    make(map[uuid.UUID]model.FillSession),
 		active:      make(map[string]uuid.UUID),
+		held:        make(map[string]float64),
 		circuits:    circuits,
 		circuitList: circuitList,
 		routes:      routes,
 		vessels:     vessels,
+		capacities:  capacities,
 		now:         now,
 	}
 }
@@ -54,6 +59,9 @@ func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.F
 	defer c.mu.Unlock()
 	if _, exists := c.active[vesselID]; exists {
 		return model.FillSession{}, ErrActiveSession
+	}
+	if err := c.checkPlan(vesselID, liters); err != nil {
+		return model.FillSession{}, err
 	}
 	selected, err := c.selectCircuit()
 	if err != nil {
@@ -105,6 +113,7 @@ func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.F
 	}
 	c.sessions[session.ID] = session
 	c.active[vesselID] = session.ID
+	c.held[vesselID] += session.PlannedLiters
 	return session, nil
 }
 
@@ -149,6 +158,46 @@ func (c *Coordinator) List() []model.FillSession {
 	return result
 }
 
+// checkPlan validates a planned fill against the vessel's capacity profile
+// and current level. It runs under c.mu together with the hold recorded at
+// the end of Start, so concurrent starts never approve the same available
+// capacity twice.
+func (c *Coordinator) checkPlan(vesselID string, liters float64) error {
+	current, ok := c.vessels.Registry().Get(vesselID)
+	if !ok {
+		return &PlanRejection{
+			Reason:   ReasonVesselUnknown,
+			VesselID: vesselID,
+			Planned:  liters,
+			Detail:   fmt.Sprintf("vessel %s is not registered", vesselID),
+		}
+	}
+	profile, ok := c.capacities.Get(vesselID)
+	if !ok {
+		return &PlanRejection{
+			Reason:   ReasonCapacityProfileMissing,
+			VesselID: vesselID,
+			Planned:  liters,
+			Detail:   fmt.Sprintf("vessel %s has no capacity profile", vesselID),
+		}
+	}
+	if rejection := validatePlan(vesselID, liters, current, profile, c.held[vesselID]); rejection != nil {
+		return rejection
+	}
+	return nil
+}
+
+// releaseHold returns a session's planned liters to the vessel's available
+// capacity. Callers must hold c.mu.
+func (c *Coordinator) releaseHold(session model.FillSession) {
+	remaining := c.held[session.VesselID] - session.PlannedLiters
+	if remaining <= 0 {
+		delete(c.held, session.VesselID)
+		return
+	}
+	c.held[session.VesselID] = remaining
+}
+
 func (c *Coordinator) selectCircuit() (circuit.Circuit, error) {
 	for _, candidate := range c.circuitList.List() {
 		if !candidate.Enabled {
@@ -164,4 +213,5 @@ func (c *Coordinator) selectCircuit() (circuit.Circuit, error) {
 func (c *Coordinator) finishState(session model.FillSession) {
 	c.sessions[session.ID] = session
 	delete(c.active, session.VesselID)
+	c.releaseHold(session)
 }

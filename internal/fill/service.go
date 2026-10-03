@@ -28,10 +28,10 @@ func (s *Service) OnLowLevel(ctx context.Context, vesselID string, observedAt ti
 	return s.coordinator.StartAutomatic(ctx, vesselID, s.defaultLiters)
 }
 
+// StartManual validates the requested volume against the vessel's capacity
+// profile and current level before any valve is opened. Non-positive volumes
+// are rejected with a PlanRejection instead of being silently replaced.
 func (s *Service) StartManual(ctx context.Context, vesselID string, liters float64) (model.FillSession, error) {
-	if liters <= 0 {
-		liters = s.defaultLiters
-	}
 	return s.coordinator.StartManual(ctx, vesselID, liters)
 }
 
